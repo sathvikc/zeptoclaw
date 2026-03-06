@@ -205,6 +205,369 @@ fn build_glob_regex(command: &str) -> Option<Regex> {
     Regex::new(&pat).ok()
 }
 
+/// A parsed command segment — one "simple command" between shell metacharacters.
+#[derive(Debug, Clone)]
+struct CommandSegment {
+    /// Executable name with path stripped (e.g., "/usr/bin/git" -> "git").
+    binary: String,
+    /// Arguments after the binary.
+    args: Vec<String>,
+    /// Original raw segment string for backward-compatible regex checks.
+    raw: String,
+}
+
+/// Result of tokenizing a command string.
+struct TokenizeResult {
+    /// Parsed command segments.
+    segments: Vec<CommandSegment>,
+    /// True if any unquoted shell metacharacter was encountered during parsing,
+    /// even if it produced only one non-empty segment (e.g., a bare `$(cmd)`).
+    has_metachar: bool,
+}
+
+/// Split a shell command string into segments on unquoted metacharacters
+/// (`;`, `|`, `&&`, `||`, `&`, backtick, `$(`), respecting single/double
+/// quotes and backslash escaping. Redirection operators (`>&`, `&>`) are
+/// not treated as command chaining.
+fn tokenize_command(command: &str) -> TokenizeResult {
+    let mut segments = Vec::new();
+    let mut current_segment = String::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut has_metachar = false;
+    let chars: Vec<char> = command.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
+
+        if in_single_quote {
+            current_segment.push(ch);
+            if ch == '\'' {
+                in_single_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double_quote {
+            current_segment.push(ch);
+            if ch == '"' {
+                in_double_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match ch {
+            // Backslash escape: next character is literal.
+            '\\' if i + 1 < chars.len() => {
+                current_segment.push(ch);
+                current_segment.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            '\'' => {
+                in_single_quote = true;
+                current_segment.push(ch);
+            }
+            '"' => {
+                in_double_quote = true;
+                current_segment.push(ch);
+            }
+            ';' | '\n' => {
+                has_metachar = true;
+                push_segment(&mut segments, &current_segment);
+                current_segment.clear();
+            }
+            '|' => {
+                // Escaped `\|` was already handled above.
+                has_metachar = true;
+                if i + 1 < chars.len() && chars[i + 1] == '|' {
+                    push_segment(&mut segments, &current_segment);
+                    current_segment.clear();
+                    i += 1;
+                } else {
+                    push_segment(&mut segments, &current_segment);
+                    current_segment.clear();
+                }
+            }
+            '&' => {
+                // Distinguish chaining `&`/`&&` from redirection `>&` and `&>`.
+                let prev_is_redirect = i > 0 && chars[i - 1] == '>';
+                let next_is_redirect = i + 1 < chars.len() && chars[i + 1] == '>';
+                if prev_is_redirect || next_is_redirect {
+                    // Part of redirection (e.g., `2>&1`, `&>file`) — not chaining.
+                    current_segment.push(ch);
+                } else if i + 1 < chars.len() && chars[i + 1] == '&' {
+                    has_metachar = true;
+                    push_segment(&mut segments, &current_segment);
+                    current_segment.clear();
+                    i += 1;
+                } else {
+                    has_metachar = true;
+                    push_segment(&mut segments, &current_segment);
+                    current_segment.clear();
+                }
+            }
+            '`' => {
+                has_metachar = true;
+                push_segment(&mut segments, &current_segment);
+                current_segment.clear();
+            }
+            '$' if i + 1 < chars.len() && chars[i + 1] == '(' => {
+                has_metachar = true;
+                push_segment(&mut segments, &current_segment);
+                current_segment.clear();
+                i += 1;
+            }
+            _ => current_segment.push(ch),
+        }
+        i += 1;
+    }
+    push_segment(&mut segments, &current_segment);
+    TokenizeResult {
+        segments,
+        has_metachar,
+    }
+}
+
+/// Parse a raw segment string into tokens (respecting quotes) and build a CommandSegment.
+fn push_segment(segments: &mut Vec<CommandSegment>, raw: &str) {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let tokens = tokenize_segment(trimmed);
+    if tokens.is_empty() {
+        return;
+    }
+    let binary_full = &tokens[0];
+    let binary = binary_full
+        .rsplit('/')
+        .next()
+        .unwrap_or(binary_full)
+        .to_lowercase();
+    segments.push(CommandSegment {
+        binary,
+        args: tokens[1..].to_vec(),
+        raw: trimmed.to_string(),
+    });
+}
+
+/// Split a single segment into tokens, stripping quotes.
+fn tokenize_segment(segment: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+
+    for ch in segment.chars() {
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if in_double {
+            if ch == '"' {
+                in_double = false;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Check if a flag char appears in any arg — either standalone (`-c`) or combined (`-Bc`).
+fn arg_has_flag(args: &[String], flag_char: char) -> bool {
+    args.iter().any(|arg| {
+        if !arg.starts_with('-') || arg.starts_with("--") {
+            return false;
+        }
+        arg[1..].contains(flag_char)
+    })
+}
+
+/// Check if any arg matches a sensitive literal pattern (with glob expansion).
+fn arg_matches_sensitive_path(args: &[String]) -> Option<String> {
+    let literals: Vec<String> = LITERAL_BLOCKED_PATTERNS
+        .iter()
+        .map(|s| s.to_lowercase())
+        .collect();
+    for arg in args {
+        let arg_lower = arg.to_lowercase();
+        // Direct match
+        for lit in &literals {
+            if arg_lower.contains(lit) {
+                return Some(lit.clone());
+            }
+        }
+        // Deglobbed match (strip brackets, ?, *)
+        let deglobbed: String = arg_lower
+            .chars()
+            .filter(|c| !matches!(c, '[' | ']' | '*' | '?'))
+            .collect();
+        for lit in &literals {
+            if deglobbed.contains(lit) {
+                return Some(lit.clone());
+            }
+        }
+        // Glob regex match
+        if arg_lower.chars().any(|c| matches!(c, '?' | '*' | '[')) {
+            if let Some(re) = build_glob_regex(&arg_lower) {
+                for lit in &literals {
+                    if re.is_match(lit) {
+                        return Some(lit.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Structured argument-level policy checks on a parsed command segment.
+fn check_structured_policy(seg: &CommandSegment) -> Result<()> {
+    let bin = seg.binary.as_str();
+
+    // Scripting inline execution: python -c, perl -e, ruby -e, node -e
+    let is_python =
+        bin == "python" || bin == "python2" || bin == "python3" || bin.starts_with("python3.");
+    if is_python && arg_has_flag(&seg.args, 'c') {
+        return Err(ZeptoError::SecurityViolation(format!(
+            "Blocked: {} with inline code execution flag (-c)",
+            seg.binary
+        )));
+    }
+    if (bin == "perl" || bin == "ruby" || bin == "node") && arg_has_flag(&seg.args, 'e') {
+        return Err(ZeptoError::SecurityViolation(format!(
+            "Blocked: {} with inline code execution flag (-e)",
+            seg.binary
+        )));
+    }
+
+    // Destructive rm: binary is rm, has -r and -f (any order/combo), target is / or /*
+    if bin == "rm" {
+        let has_r = seg.args.iter().any(|a| {
+            a == "-r"
+                || a == "-R"
+                || (a.starts_with('-')
+                    && !a.starts_with("--")
+                    && (a.contains('r') || a.contains('R')))
+        });
+        let has_f = seg
+            .args
+            .iter()
+            .any(|a| a == "-f" || (a.starts_with('-') && !a.starts_with("--") && a.contains('f')));
+        let has_root_target = seg.args.iter().any(|a| {
+            !a.starts_with('-') && {
+                let trimmed = a.trim_end_matches('*');
+                trimmed == "/" || (trimmed.is_empty() && a.starts_with('*'))
+            }
+        });
+        if has_r && has_f && has_root_target {
+            return Err(ZeptoError::SecurityViolation(
+                "Blocked: rm -rf / (destructive root deletion)".to_string(),
+            ));
+        }
+    }
+
+    // Destructive git operations (structural check)
+    if bin == "git" {
+        // Skip global options (e.g. -C, --git-dir) to find the real subcommand.
+        // Some global options consume the next arg as a value — skip those too.
+        const GIT_OPTS_WITH_VALUE: &[&str] =
+            &["-C", "-c", "--git-dir", "--work-tree", "--namespace"];
+        let subcommand = {
+            let mut iter = seg.args.iter();
+            loop {
+                match iter.next() {
+                    None => break "",
+                    Some(a) if a.starts_with('-') => {
+                        let base = a.split('=').next().unwrap_or(a);
+                        if GIT_OPTS_WITH_VALUE.contains(&base) && !a.contains('=') {
+                            iter.next(); // skip the value argument
+                        }
+                    }
+                    Some(a) => break a.as_str(),
+                }
+            }
+        };
+        match subcommand {
+            "push" => {
+                let has_force = seg.args.iter().any(|a| {
+                    a == "--force"
+                        || a == "--force-with-lease"
+                        || (a.starts_with('-') && !a.starts_with("--") && a.contains('f'))
+                });
+                if has_force {
+                    return Err(ZeptoError::SecurityViolation(
+                        "Blocked: git push --force (destructive push)".to_string(),
+                    ));
+                }
+            }
+            "reset" => {
+                if seg.args.iter().any(|a| a == "--hard") {
+                    return Err(ZeptoError::SecurityViolation(
+                        "Blocked: git reset --hard (destructive reset)".to_string(),
+                    ));
+                }
+            }
+            "clean" => {
+                let has_force = seg.args.iter().any(|a| {
+                    a == "--force"
+                        || (a.starts_with('-') && !a.starts_with("--") && a.contains('f'))
+                });
+                if has_force {
+                    return Err(ZeptoError::SecurityViolation(
+                        "Blocked: git clean -f (destructive clean)".to_string(),
+                    ));
+                }
+            }
+            "branch" => {
+                if seg
+                    .args
+                    .iter()
+                    .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('D'))
+                {
+                    return Err(ZeptoError::SecurityViolation(
+                        "Blocked: git branch -D (force delete)".to_string(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Sensitive path in any argument
+    if let Some(path) = arg_matches_sensitive_path(&seg.args) {
+        return Err(ZeptoError::SecurityViolation(format!(
+            "Blocked: argument contains prohibited path '{}'",
+            path
+        )));
+    }
+
+    Ok(())
+}
+
 /// Controls allowlist enforcement behaviour.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum ShellAllowlistMode {
@@ -312,13 +675,19 @@ impl ShellSecurityConfig {
             return Ok(());
         }
 
-        // Normalize git commands so global options don't bypass destructive-op patterns
-        let normalized = normalize_git_command(command);
-        let command_lower = command.to_lowercase();
+        let TokenizeResult {
+            segments,
+            has_metachar,
+        } = tokenize_command(command);
 
-        // Check regex patterns (against both original and normalized form)
+        // Pass 1: Regex blocklist on the FULL command string and its git-normalized
+        // form. Some patterns are inherently cross-segment (e.g. `curl ... | sh`),
+        // so we must check the whole string before splitting.
+        // Git global option bypasses within segments are caught by
+        // check_structured_policy() in Pass 2.
+        let full_normalized = normalize_git_command(command);
         for pattern in &self.compiled_patterns {
-            if pattern.is_match(command) || pattern.is_match(&normalized) {
+            if pattern.is_match(command) || pattern.is_match(&full_normalized) {
                 log_audit_event(
                     AuditCategory::ShellSecurity,
                     AuditSeverity::Critical,
@@ -336,57 +705,47 @@ impl ShellSecurityConfig {
             }
         }
 
-        // Check literal patterns.
-        // Strip shell glob characters so that e.g. `/etc/pass[w]d` still matches
-        // the literal `/etc/passwd`. See GHSA-5wp8-q9mx-8jx8.
-        //
-        // Heuristic 1: Remove brackets — `pass[w]d` → `passwd`
-        // Heuristic 2: For each token containing glob chars, build a regex
-        //              (`?` → `.`, `*` → `.*`, brackets stripped) and check
-        //              if any literal matches that expanded pattern.
-        let deglobbed: String = command_lower
-            .chars()
-            .filter(|c| !matches!(c, '[' | ']' | '*' | '?'))
-            .collect();
-        // Pre-compile glob regexes for tokens that contain glob characters
-        let glob_token_regexes: Vec<Regex> = command_lower
-            .split_whitespace()
-            .filter(|tok| tok.chars().any(|c| matches!(c, '?' | '*' | '[')))
-            .filter_map(build_glob_regex)
-            .collect();
-        for literal in &self.literal_patterns {
-            let matched = command_lower.contains(literal)
-                || deglobbed.contains(literal)
-                || glob_token_regexes.iter().any(|re| re.is_match(literal));
-            if matched {
-                log_audit_event(
-                    AuditCategory::ShellSecurity,
-                    AuditSeverity::Critical,
-                    "command_blocked_literal",
-                    &format!("Command blocked: contains prohibited path '{}'", literal),
-                    true,
-                );
-                return Err(ZeptoError::SecurityViolation(format!(
-                    "Command blocked: contains prohibited path '{}'",
-                    literal
-                )));
+        // Pass 2: Per-segment checks (literal blocklist + structured policy).
+        for seg in &segments {
+            let seg_lower = seg.raw.to_lowercase();
+
+            // (a) Literal blocklist (on raw segment, with glob expansion).
+            let deglobbed: String = seg_lower
+                .chars()
+                .filter(|c| !matches!(c, '[' | ']' | '*' | '?'))
+                .collect();
+            let glob_token_regexes: Vec<Regex> = seg_lower
+                .split_whitespace()
+                .filter(|tok| tok.chars().any(|c| matches!(c, '?' | '*' | '[')))
+                .filter_map(build_glob_regex)
+                .collect();
+            for literal in &self.literal_patterns {
+                let matched = seg_lower.contains(literal)
+                    || deglobbed.contains(literal)
+                    || glob_token_regexes.iter().any(|re| re.is_match(literal));
+                if matched {
+                    log_audit_event(
+                        AuditCategory::ShellSecurity,
+                        AuditSeverity::Critical,
+                        "command_blocked_literal",
+                        &format!("Command blocked: contains prohibited path '{}'", literal),
+                        true,
+                    );
+                    return Err(ZeptoError::SecurityViolation(format!(
+                        "Command blocked: contains prohibited path '{}'",
+                        literal
+                    )));
+                }
             }
+
+            // (b) Structured argument-level policy check (NEW).
+            check_structured_policy(seg)?;
         }
 
-        // Allowlist check (runs after blocklist).
-        // GHSA-5wp8-q9mx-8jx8: Previously only checked the first token, so
-        // `git status; python -c '...'` would pass if `git` was allowlisted.
-        // Now we also detect shell metacharacters that enable command chaining.
+        // Allowlist check: validate EVERY segment's binary.
         if self.allowlist_mode != ShellAllowlistMode::Off {
-            // Detect command-chaining metacharacters. If the command contains
-            // any of these, the first-token allowlist check is meaningless
-            // because subsequent commands can be anything.
-            let has_chaining_metachar = command_lower
-                .chars()
-                .any(|c| matches!(c, ';' | '|' | '&' | '`' | '\n'))
-                || command_lower.contains("$(");
-
-            if has_chaining_metachar {
+            // Any metacharacter (even in a bare `$(cmd)`) means potential chaining.
+            if has_metachar {
                 match self.allowlist_mode {
                     ShellAllowlistMode::Strict => {
                         return Err(ZeptoError::SecurityViolation(
@@ -400,36 +759,28 @@ impl ShellSecurityConfig {
                             "Command contains shell metacharacters that bypass allowlist"
                         );
                     }
-                    ShellAllowlistMode::Off => {} // unreachable
+                    ShellAllowlistMode::Off => {}
                 }
             }
 
-            // Empty allowlist in Strict mode means NOTHING is allowed.
-            // Previously, `!self.allowlist.is_empty()` guard skipped the check,
-            // effectively making empty allowlist equivalent to Off.
-            let first_token = command
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_lowercase();
-            // Strip path prefix (e.g. /usr/bin/git -> git)
-            let executable = first_token.rsplit('/').next().unwrap_or(&first_token);
-            if !self.allowlist.iter().any(|a| a == executable) {
-                match self.allowlist_mode {
-                    ShellAllowlistMode::Strict => {
-                        return Err(ZeptoError::SecurityViolation(format!(
-                            "Command '{}' not in allowlist",
-                            executable
-                        )));
+            for seg in &segments {
+                if !self.allowlist.iter().any(|a| a == &seg.binary) {
+                    match self.allowlist_mode {
+                        ShellAllowlistMode::Strict => {
+                            return Err(ZeptoError::SecurityViolation(format!(
+                                "Command '{}' not in allowlist",
+                                seg.binary
+                            )));
+                        }
+                        ShellAllowlistMode::Warn => {
+                            tracing::warn!(
+                                command = %command,
+                                executable = %seg.binary,
+                                "Command not in allowlist"
+                            );
+                        }
+                        ShellAllowlistMode::Off => {}
                     }
-                    ShellAllowlistMode::Warn => {
-                        tracing::warn!(
-                            command = %command,
-                            executable = %executable,
-                            "Command not in allowlist"
-                        );
-                    }
-                    ShellAllowlistMode::Off => {} // unreachable
                 }
             }
         }
@@ -1011,5 +1362,312 @@ mod tests {
         assert!(config.validate_command("/usr/local/bin/git log").is_ok());
         // A different binary via full path is still blocked
         assert!(config.validate_command("/usr/bin/ls -la").is_err());
+    }
+
+    // ==================== TOKENIZER TESTS ====================
+
+    #[test]
+    fn test_tokenize_single_command() {
+        let r = tokenize_command("git status");
+        assert_eq!(r.segments.len(), 1);
+        assert!(!r.has_metachar);
+        assert_eq!(r.segments[0].binary, "git");
+        assert_eq!(r.segments[0].args, vec!["status"]);
+    }
+
+    #[test]
+    fn test_tokenize_quoted_args() {
+        let r = tokenize_command("git commit -m \"hello world\"");
+        assert_eq!(r.segments.len(), 1);
+        assert_eq!(r.segments[0].binary, "git");
+        assert_eq!(r.segments[0].args, vec!["commit", "-m", "hello world"]);
+    }
+
+    #[test]
+    fn test_tokenize_single_quoted_args() {
+        let r = tokenize_command("curl -H 'Authorization: Bearer tok'");
+        assert_eq!(r.segments.len(), 1);
+        assert_eq!(r.segments[0].binary, "curl");
+        assert_eq!(r.segments[0].args, vec!["-H", "Authorization: Bearer tok"]);
+    }
+
+    #[test]
+    fn test_tokenize_semicolon_split() {
+        let r = tokenize_command("git status; python3 -c 'evil'");
+        assert_eq!(r.segments.len(), 2);
+        assert!(r.has_metachar);
+        assert_eq!(r.segments[0].binary, "git");
+        assert_eq!(r.segments[1].binary, "python3");
+        assert_eq!(r.segments[1].args, vec!["-c", "evil"]);
+    }
+
+    #[test]
+    fn test_tokenize_pipe_split() {
+        let r = tokenize_command("cat file | sh");
+        assert_eq!(r.segments.len(), 2);
+        assert!(r.has_metachar);
+        assert_eq!(r.segments[0].binary, "cat");
+        assert_eq!(r.segments[1].binary, "sh");
+    }
+
+    #[test]
+    fn test_tokenize_and_and_split() {
+        let r = tokenize_command("git status && curl evil.com");
+        assert_eq!(r.segments.len(), 2);
+        assert!(r.has_metachar);
+        assert_eq!(r.segments[0].binary, "git");
+        assert_eq!(r.segments[1].binary, "curl");
+    }
+
+    #[test]
+    fn test_tokenize_path_stripped() {
+        let r = tokenize_command("/usr/bin/git status");
+        assert_eq!(r.segments.len(), 1);
+        assert_eq!(r.segments[0].binary, "git");
+    }
+
+    #[test]
+    fn test_tokenize_empty_segments_skipped() {
+        let r = tokenize_command("; ; git status");
+        assert_eq!(r.segments.len(), 1);
+        assert!(r.has_metachar);
+        assert_eq!(r.segments[0].binary, "git");
+    }
+
+    #[test]
+    fn test_tokenize_bare_subshell_sets_metachar() {
+        // $(cmd) with nothing before it — 1 segment but has_metachar is true
+        let r = tokenize_command("$(printf 'touch /tmp/pwn')");
+        assert!(r.has_metachar);
+    }
+
+    #[test]
+    fn test_tokenize_backslash_pipe_not_split() {
+        // grep foo\|bar is a single command (escaped pipe in regex)
+        let r = tokenize_command(r"grep foo\|bar file");
+        assert_eq!(r.segments.len(), 1);
+        assert!(!r.has_metachar);
+        assert_eq!(r.segments[0].binary, "grep");
+    }
+
+    #[test]
+    fn test_tokenize_redirect_ampersand_not_split() {
+        // 2>&1 is redirection, not command chaining
+        let r = tokenize_command("cargo test 2>&1");
+        assert_eq!(r.segments.len(), 1);
+        assert!(!r.has_metachar);
+        assert_eq!(r.segments[0].binary, "cargo");
+    }
+
+    #[test]
+    fn test_tokenize_redirect_ampersand_gt_not_split() {
+        // &>file is redirection, not command chaining
+        let r = tokenize_command("cargo build &>/dev/null");
+        assert_eq!(r.segments.len(), 1);
+        assert!(!r.has_metachar);
+        assert_eq!(r.segments[0].binary, "cargo");
+    }
+
+    // ==================== STRUCTURED POLICY TESTS ====================
+
+    #[test]
+    fn test_structured_blocks_python_c_reordered_flags() {
+        let seg = CommandSegment {
+            binary: "python3".into(),
+            args: vec!["-B".into(), "-u".into(), "-c".into(), "evil".into()],
+            raw: "python3 -B -u -c evil".into(),
+        };
+        assert!(check_structured_policy(&seg).is_err());
+    }
+
+    #[test]
+    fn test_structured_blocks_python_combined_c_flag() {
+        let seg = CommandSegment {
+            binary: "python3".into(),
+            args: vec!["-Bc".into(), "evil".into()],
+            raw: "python3 -Bc evil".into(),
+        };
+        assert!(check_structured_policy(&seg).is_err());
+    }
+
+    #[test]
+    fn test_structured_allows_python_script_file() {
+        let seg = CommandSegment {
+            binary: "python3".into(),
+            args: vec!["script.py".into()],
+            raw: "python3 script.py".into(),
+        };
+        assert!(check_structured_policy(&seg).is_ok());
+    }
+
+    #[test]
+    fn test_structured_blocks_perl_e_reordered() {
+        let seg = CommandSegment {
+            binary: "perl".into(),
+            args: vec!["-w".into(), "-T".into(), "-e".into(), "system('id')".into()],
+            raw: "perl -w -T -e system('id')".into(),
+        };
+        assert!(check_structured_policy(&seg).is_err());
+    }
+
+    #[test]
+    fn test_structured_blocks_rm_rf_root_any_order() {
+        let seg = CommandSegment {
+            binary: "rm".into(),
+            args: vec!["-f".into(), "-r".into(), "/".into()],
+            raw: "rm -f -r /".into(),
+        };
+        assert!(check_structured_policy(&seg).is_err());
+    }
+
+    #[test]
+    fn test_structured_allows_rm_normal_dir() {
+        let seg = CommandSegment {
+            binary: "rm".into(),
+            args: vec!["-rf".into(), "./temp".into()],
+            raw: "rm -rf ./temp".into(),
+        };
+        assert!(check_structured_policy(&seg).is_ok());
+    }
+
+    #[test]
+    fn test_structured_blocks_sensitive_path_in_args() {
+        let seg = CommandSegment {
+            binary: "cat".into(),
+            args: vec!["/etc/shadow".into()],
+            raw: "cat /etc/shadow".into(),
+        };
+        assert!(check_structured_policy(&seg).is_err());
+    }
+
+    #[test]
+    fn test_structured_blocks_git_push_force_in_args() {
+        let seg = CommandSegment {
+            binary: "git".into(),
+            args: vec![
+                "push".into(),
+                "origin".into(),
+                "main".into(),
+                "--force".into(),
+            ],
+            raw: "git push origin main --force".into(),
+        };
+        assert!(check_structured_policy(&seg).is_err());
+    }
+
+    #[test]
+    fn test_structured_blocks_git_global_option_bypass() {
+        // git -C <path> push --force should still be caught
+        let seg = CommandSegment {
+            binary: "git".into(),
+            args: vec![
+                "-C".into(),
+                "/tmp".into(),
+                "push".into(),
+                "--force".into(),
+                "origin".into(),
+                "main".into(),
+            ],
+            raw: "git -C /tmp push --force origin main".into(),
+        };
+        assert!(check_structured_policy(&seg).is_err());
+    }
+
+    #[test]
+    fn test_structured_blocks_git_reset_hard() {
+        let seg = CommandSegment {
+            binary: "git".into(),
+            args: vec!["reset".into(), "--hard".into()],
+            raw: "git reset --hard".into(),
+        };
+        assert!(check_structured_policy(&seg).is_err());
+    }
+
+    #[test]
+    fn test_structured_blocks_git_clean_force() {
+        let seg = CommandSegment {
+            binary: "git".into(),
+            args: vec!["clean".into(), "-fd".into()],
+            raw: "git clean -fd".into(),
+        };
+        assert!(check_structured_policy(&seg).is_err());
+    }
+
+    #[test]
+    fn test_structured_blocks_git_branch_force_delete() {
+        let seg = CommandSegment {
+            binary: "git".into(),
+            args: vec!["branch".into(), "-D".into(), "feature".into()],
+            raw: "git branch -D feature".into(),
+        };
+        assert!(check_structured_policy(&seg).is_err());
+    }
+
+    // ==================== INTEGRATION TESTS ====================
+
+    #[test]
+    fn test_integration_multi_segment_blocks_second_command() {
+        let config = ShellSecurityConfig::new();
+        assert!(config
+            .validate_command("git status; python3 -c 'evil'")
+            .is_err());
+    }
+
+    #[test]
+    fn test_integration_allowlist_checks_every_segment() {
+        let config =
+            ShellSecurityConfig::new().with_allowlist(vec!["git"], ShellAllowlistMode::Strict);
+        assert!(config
+            .validate_command("git status && curl evil.com")
+            .is_err());
+    }
+
+    #[test]
+    fn test_integration_quoted_path_still_blocked() {
+        let config = ShellSecurityConfig::new();
+        assert!(config.validate_command("cat '/etc/shadow'").is_err());
+    }
+
+    #[test]
+    fn test_integration_backward_compat_single_command() {
+        let config = ShellSecurityConfig::new();
+        assert!(config.validate_command("git status").is_ok());
+        assert!(config.validate_command("cargo build").is_ok());
+        assert!(config.validate_command("ls -la").is_ok());
+    }
+
+    #[test]
+    fn test_integration_bare_subshell_blocked_in_strict() {
+        // Bare $(cmd) should be blocked even though it produces only 1 segment
+        let config =
+            ShellSecurityConfig::new().with_allowlist(vec!["printf"], ShellAllowlistMode::Strict);
+        assert!(
+            config
+                .validate_command("$(printf 'touch /tmp/pwn')")
+                .is_err(),
+            "Bare $() substitution should be blocked in Strict mode"
+        );
+    }
+
+    #[test]
+    fn test_integration_escaped_pipe_allowed_in_strict() {
+        // grep foo\|bar is a single command, not command chaining
+        let config =
+            ShellSecurityConfig::new().with_allowlist(vec!["grep"], ShellAllowlistMode::Strict);
+        assert!(
+            config.validate_command(r"grep foo\|bar file").is_ok(),
+            r"grep foo\|bar should not be treated as pipe chaining"
+        );
+    }
+
+    #[test]
+    fn test_integration_redirect_ampersand_allowed_in_strict() {
+        // cargo test 2>&1 is redirection, not command chaining
+        let config =
+            ShellSecurityConfig::new().with_allowlist(vec!["cargo"], ShellAllowlistMode::Strict);
+        assert!(
+            config.validate_command("cargo test 2>&1").is_ok(),
+            "2>&1 should not be treated as background &"
+        );
     }
 }
