@@ -259,6 +259,53 @@ pub fn validate_config(raw: &Value) -> Vec<Diagnostic> {
                         message: "Empty \u{2014} anyone can message the bot".to_string(),
                     });
                 }
+
+                if name == "email"
+                    && enabled
+                    && channel_obj
+                        .get("allowed_senders")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|senders| !senders.is_empty())
+                {
+                    diagnostics.push(Diagnostic {
+                        level: DiagnosticLevel::Warn,
+                        path: "channels.email.allowed_senders".to_string(),
+                        message: "Email sender allowlists trust the parsed From header only; enforce SPF/DKIM/DMARC upstream if sender authenticity matters".to_string(),
+                    });
+                }
+
+                if name == "telegram" {
+                    let allow_usernames = channel_obj
+                        .get("allow_usernames")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let has_username_entries = channel_obj
+                        .get("allow_from")
+                        .and_then(|v| v.as_array())
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .filter_map(|entry| entry.as_str())
+                                .any(|entry| {
+                                    let trimmed = entry.trim();
+                                    trimmed.is_empty()
+                                        || !trimmed.bytes().all(|b| b.is_ascii_digit())
+                                })
+                        })
+                        .unwrap_or(false);
+
+                    if has_username_entries {
+                        diagnostics.push(Diagnostic {
+                            level: DiagnosticLevel::Warn,
+                            path: "channels.telegram.allow_from".to_string(),
+                            message: if allow_usernames {
+                                "Telegram username allowlist entries are legacy and can be reassigned; prefer numeric user IDs and set allow_usernames=false after migration".to_string()
+                            } else {
+                                "Telegram allow_from contains non-numeric entries, but allow_usernames=false so they will never match".to_string()
+                            },
+                        });
+                    }
+                }
             }
         }
     }
@@ -524,6 +571,67 @@ mod tests {
         let diags = validate_config(&raw);
         assert!(diags.iter().any(|d| {
             d.level == DiagnosticLevel::Warn && d.message.contains("anyone can message")
+        }));
+    }
+
+    #[test]
+    fn test_validate_email_allowed_senders_warns_header_only_trust() {
+        let raw = json!({
+            "channels": {
+                "email": {
+                    "enabled": true,
+                    "imap_host": "imap.example.com",
+                    "smtp_host": "smtp.example.com",
+                    "username": "bot@example.com",
+                    "password": "secret",
+                    "allowed_senders": ["@example.com"]
+                }
+            }
+        });
+        let diags = validate_config(&raw);
+        assert!(diags.iter().any(|d| {
+            d.level == DiagnosticLevel::Warn
+                && d.path == "channels.email.allowed_senders"
+                && d.message.contains("From header")
+        }));
+    }
+
+    #[test]
+    fn test_validate_telegram_username_allowlist_warns() {
+        let raw = json!({
+            "channels": {
+                "telegram": {
+                    "enabled": true,
+                    "token": "abc",
+                    "allow_from": ["alice"]
+                }
+            }
+        });
+        let diags = validate_config(&raw);
+        assert!(diags.iter().any(|d| {
+            d.level == DiagnosticLevel::Warn
+                && d.path == "channels.telegram.allow_from"
+                && d.message.contains("legacy")
+        }));
+    }
+
+    #[test]
+    fn test_validate_telegram_username_allowlist_disabled_warns_non_matching() {
+        let raw = json!({
+            "channels": {
+                "telegram": {
+                    "enabled": true,
+                    "token": "abc",
+                    "allow_from": ["alice"],
+                    "allow_usernames": false
+                }
+            }
+        });
+        let diags = validate_config(&raw);
+        assert!(diags.iter().any(|d| {
+            d.level == DiagnosticLevel::Warn
+                && d.path == "channels.telegram.allow_from"
+                && d.message.contains("never match")
         }));
     }
 
