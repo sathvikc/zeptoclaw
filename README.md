@@ -363,3 +363,7 @@ ZeptoClaw is a pure open-source software project. It has no token, no cryptocurr
 <p align="center">
   Built by <a href="https://github.com/qhkm">Aisar Labs</a>
 </p>
+
+---
+
+For commercial licensing, enterprise support, or managed hosting inquiries: **qaiyyum@aisar.ai**
